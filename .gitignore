@@ -1,0 +1,87 @@
+# Environnements virtuels
+*.env
+.venv
+venv
+.env/
+
+# Variables d’environnement
+*.env
+*.env.*
+
+# Byte-code Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Poetry
+poetry.lock
+
+# uv
+uv.lock
+
+# Ruff cache
+.ruff_cache/
+
+# Cache et rapports de tests
+.pytest_cache/
+.coverage
+htmlcov/
+.cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+cache
+
+# Distribution et packaging
+build
+dist
+*.egg-info
+
+# Extensions compilées
+*.so
+
+# Logs
+*.log
+logs 
+
+# Base de données locale
+*.sqlite3
+
+# IDEs et éditeurs
+.vscode/
+.idea/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+
+# Profilage
+.prof
+
+# Modèles PyTorch
+*.pt
+layoutlmv3-cord-finetuned 
+annotations.json
+**/results*/
+*work_dirs
+
+# data files
+temp_images
+*temp_annot.jsonl
+*temp_annot
+*static
+*images
+*temp_images
+*temp_marked
+*temp_results
+*temp_uploads
+*uploads
+*output_blocks
+*screenshots
+
+# OLD
+*old
