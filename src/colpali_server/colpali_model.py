@@ -3,6 +3,7 @@
 import logging
 from collections.abc import Sequence
 from typing import Any
+import gc
 
 import torch
 from PIL import Image
@@ -42,8 +43,22 @@ class ColPaliModel:
 
     def _get_device(self) -> str:
         """Détermine le meilleur device disponible."""
-        logger.info("🖥️ Forçage de l'utilisation du CPU pour éviter les problèmes de mémoire GPU")
-        return "cpu"
+        if torch.cuda.is_available():
+            # Vérifier la mémoire GPU disponible
+            gpu_props = torch.cuda.get_device_properties(0)
+            gpu_mem = gpu_props.total_memory  # type: ignore[attr-defined]
+            allocated_mem = torch.cuda.memory_allocated(0)
+            free_mem = gpu_mem - allocated_mem
+            
+            # Nécessite au moins 4GB de mémoire libre
+            if free_mem >= 4 * 1024 * 1024 * 1024:
+                return "cuda:0"
+            else:
+                logger.warning("⚠️ Mémoire GPU insuffisante, utilisation du CPU")
+                return "cpu"
+        else:
+            logger.info("ℹ️ CUDA non disponible, utilisation du CPU")
+            return "cpu"
 
     def _load_model(self) -> None:
         """Charge le modèle ColPali."""
@@ -63,16 +78,27 @@ class ColPaliModel:
                     low_cpu_mem_usage=True,
                 ).eval()
             else:
-                # Chargement GPU
+                # Chargement GPU avec optimisations mémoire
                 self.model = ColQwen2.from_pretrained(
                     self.model_path,
-                    torch_dtype=torch.bfloat16,
+                    torch_dtype=torch.float16,
                     device_map="auto",
                     attn_implementation=("flash_attention_2" if is_flash_attn_2_available() else None),
+                    low_cpu_mem_usage=True,  # Ajout pour économiser la mémoire
+                    max_memory={0: "4.5GiB"},
                 ).eval()
 
             # Charger le processeur
             self.processor = ColQwen2Processor.from_pretrained(self.model_path)
+
+            # Nettoyage du cache
+            if self.device != "cpu" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
+                # Afficher la mémoire GPU disponible
+                allocated = torch.cuda.memory_allocated(0) / 1024**3
+                reserved = torch.cuda.memory_reserved(0) / 1024**3
+                logger.info(f"📊 Mémoire GPU après chargement: {allocated:.2f}GB alloués, {reserved:.2f}GB réservés")
 
             logger.info("✅ Modèle ColPali chargé avec succès")
 
@@ -111,12 +137,13 @@ class ColPaliModel:
                 batch_images.append(img)
 
             try:
-                # Utiliser le processeur directement au lieu de DataLoader
-                # pour éviter les problèmes de type avec Dataset
+                # Utiliser le processeur directement
                 with torch.no_grad():
                     # Traiter les images du batch
                     batch_doc = self.processor.process_images(batch_images)
                     batch_doc = {k: v.to(self.model.device) for k, v in batch_doc.items()}
+                    
+                    # Générer les embeddings
                     batch_embeddings = self.model(**batch_doc)
 
                     # batch_embeddings shape: (batch_size, num_patches, hidden_dim)
@@ -129,7 +156,27 @@ class ColPaliModel:
                             logger.warning(f"⚠️ Dimension d'embedding inattendue: {len(mean_embedding)}, attendu: 128")
 
                         embeddings.append(mean_embedding.tolist())
+                    
+                    # IMPORTANT: Libérer la mémoire GPU après chaque batch
+                    del batch_embeddings
+                    del batch_doc
+                    
+                    if self.device != "cpu" and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        # Force garbage collection
+                        gc.collect()
 
+            except torch.cuda.OutOfMemoryError as e:
+                logger.error(f"❌ Mémoire GPU insuffisante pour le batch {i//self.batch_size + 1}")
+                logger.error(f"   Essayez de réduire la taille du batch ou utilisez le CPU")
+                # Nettoyer la mémoire GPU
+                if self.device != "cpu" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                # Ajouter des embeddings vides pour maintenir la correspondance
+                for _ in batch:
+                    embeddings.append([0.0] * 128)
+                    
             except Exception as e:
                 logger.error(
                     f"❌ Erreur lors de la génération de l'embedding pour le batch {i//self.batch_size + 1}: {e}"
@@ -175,6 +222,13 @@ class ColPaliModel:
                     logger.warning(
                         f"⚠️ Dimension d'embedding de requête inattendue: {len(mean_embedding)}, attendu: 128"
                     )
+                
+                # Libérer la mémoire
+                del embeddings
+                del batch_doc
+                
+                if self.device != "cpu" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             return mean_embedding.tolist()
 
@@ -206,6 +260,9 @@ class ColPaliModel:
                 del self.model
             if hasattr(self, "processor"):
                 del self.processor
+            
+            # Force garbage collection
+            gc.collect()
 
             logger.info("✅ Nettoyage du modèle terminé")
 
@@ -224,6 +281,7 @@ class ColPaliModel:
         if torch.cuda.is_available() and self.device != "cpu":
             info["gpu_name"] = torch.cuda.get_device_name(0)
             info["gpu_memory_allocated"] = f"{torch.cuda.memory_allocated(0) / 1024**3:.2f} GB"
+            info["gpu_memory_reserved"] = f"{torch.cuda.memory_reserved(0) / 1024**3:.2f} GB"
             info["gpu_memory_total"] = f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB"
 
         return info

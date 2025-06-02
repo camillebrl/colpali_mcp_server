@@ -352,13 +352,24 @@ class ImageRAGServer:
                             "batch_size": {
                                 "type": "integer",
                                 "description": "Taille du batch pour l'indexation",
-                                "default": 10,
+                                "default": 1,
                                 "minimum": 1,
-                                "maximum": 50,
+                                "maximum": 10,
+                            },
+                            "single_index": {
+                                "type": "boolean",
+                                "description": "Créer un seul index pour toutes les images (défaut: true)",
+                                "default": True, 
+                            },
+                            "index_name": {
+                                "type": "string",
+                                "description": "Nom personnalisé pour l'index (utilisé uniquement si single_index=true)",
+                                "default": None,
                             },
                         },
                     },
                 ),
+
                 Tool(
                     name="list_screenshot_indices",
                     description="Lister tous les index de screenshots disponibles avec leurs statistiques",
@@ -405,6 +416,30 @@ class ImageRAGServer:
                 logger.exception(f"Erreur lors de l'exécution de l'outil {name}")
                 return [TextContent(type="text", text=f"❌ Erreur: {str(e)}")]
 
+    def _find_common_prefix(self, strings: list[str]) -> str:
+        """Trouve le préfixe commun le plus long dans une liste de chaînes."""
+        if not strings:
+            return ""
+        
+        # Trier pour faciliter la comparaison
+        strings = sorted(strings)
+        first = strings[0]
+        last = strings[-1]
+        
+        # Trouver le préfixe commun entre le premier et le dernier
+        i = 0
+        while i < len(first) and i < len(last) and first[i] == last[i]:
+            i += 1
+        
+        # Retourner le préfixe commun
+        prefix = first[:i]
+        
+        # Si le préfixe se termine par un séparateur incomplet, le retirer
+        if prefix and prefix[-1] in ['_', '-', '.']:
+            prefix = prefix[:-1]
+        
+        return prefix
+    
     async def _search_screenshots(self, args: dict[str, Any]) -> list[TextContent | ImageContent | EmbeddedResource]:
         """Recherche des screenshots pertinents dans les index sélectionnés."""
         query = args["query"]
@@ -527,10 +562,11 @@ class ImageRAGServer:
             ]
 
     async def _index_screenshots(self, args: dict[str, Any]) -> list[TextContent | ImageContent | EmbeddedResource]:
-        """Indexe les screenshots depuis le dossier spécifié."""
+        """Indexe les screenshots depuis le dossier spécifié dans UN SEUL index."""
         screenshots_dir = args.get("screenshots_dir", "./screenshots")
         overwrite_existing = args.get("overwrite_existing", False)
-        batch_size = args.get("batch_size", 10)
+        batch_size = args.get("batch_size", 1)
+        custom_index_name = args.get("index_name", None)
 
         logger.info(f"📥 Indexation des screenshots depuis: {screenshots_dir}")
 
@@ -549,112 +585,133 @@ class ImageRAGServer:
                     )
                 ]
 
-            # Statistiques globales
-            total_images = sum(len(images) for images in screenshots_by_source.values())
-            total_sources = len(screenshots_by_source)
-            indexed_sources = 0
-            total_indexed = 0
-
-            summary = f"📊 Indexation de {total_images} screenshots de {total_sources} sources\n\n"
-
-            # Indexer chaque source dans son propre index
-            for source, images_metadata in screenshots_by_source.items():
-                index_name = f"screenshot_{source}"
-
-                logger.info(f"📂 Traitement de la source '{source}' -> index '{index_name}'")
-
-                # Vérifier si l'index existe
-                if self.es_model.es and self.es_model.es.indices.exists(index=index_name):
-                    if overwrite_existing:
-                        logger.info(f"🗑️ Suppression de l'index existant: {index_name}")
-                        self.es_model.es.indices.delete(index=index_name)
+            # TOUJOURS regrouper toutes les images sous un seul index
+            # Générer le nom de l'index
+            if custom_index_name:
+                index_base_name = custom_index_name
+            else:
+                # Utiliser le nom du dossier ou un nom par défaut
+                folder_name = Path(screenshots_dir).name
+                
+                if folder_name == "screenshots":
+                    # Chercher un pattern commun dans les noms de fichiers
+                    all_sources = list(screenshots_by_source.keys())
+                    
+                    if len(all_sources) == 1:
+                        # Une seule source détectée, l'utiliser
+                        index_base_name = all_sources[0]
                     else:
-                        logger.info(f"⚠️ Index existant ignoré: {index_name}")
-                        summary += f"⚠️ {source}: Index existant ignoré ({len(images_metadata)} images)\n"
-                        continue
+                        # Plusieurs sources, essayer de trouver un préfixe commun
+                        common_prefix = self._find_common_prefix(all_sources)
+                        if common_prefix and len(common_prefix) > 2:
+                            index_base_name = common_prefix.rstrip("_-")
+                        else:
+                            # Pas de préfixe commun, utiliser un nom générique avec timestamp
+                            from datetime import datetime
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+                            index_base_name = f"all_screenshots_{timestamp}"
+                else:
+                    index_base_name = folder_name
 
-                # Créer une instance ES pour cet index
-                es_instance = ElasticsearchModel(
-                    index_name=index_name,
-                    es_host=self.es_model.es_host,
-                    es_user=self.es_model.es_user,
-                    es_password=self.es_model.es_password,
+            # Nettoyer et normaliser le nom d'index
+            index_base_name = re.sub(r"[^a-zA-Z0-9\._-]", "_", index_base_name).lower()
+            index_name = f"screenshot_{index_base_name}"
+
+            # Regrouper TOUTES les images dans une seule liste
+            all_images_metadata = []
+            for source, images_metadata in screenshots_by_source.items():
+                for img, metadata in images_metadata:
+                    # Ajouter la source originale dans les métadonnées
+                    metadata["original_source"] = source
+                    all_images_metadata.append((img, metadata))
+
+            logger.info(f"📂 Toutes les images ({len(all_images_metadata)}) seront dans l'index unique '{index_name}'")
+
+            # Statistiques
+            total_images = len(all_images_metadata)
+            summary = f"📊 Indexation de {total_images} screenshots dans l'index '{index_name}'\n\n"
+
+            # Vérifier si l'index existe
+            if self.es_model.es and self.es_model.es.indices.exists(index=index_name):
+                if overwrite_existing:
+                    logger.info(f"🗑️ Suppression de l'index existant: {index_name}")
+                    self.es_model.es.indices.delete(index=index_name)
+                else:
+                    return [
+                        TextContent(
+                            type="text",
+                            text=f"⚠️ L'index '{index_name}' existe déjà. Utilisez overwrite_existing=true pour le remplacer.",
+                        )
+                    ]
+
+            # Créer une instance ES pour cet index unique
+            es_instance = ElasticsearchModel(
+                index_name=index_name,
+                es_host=self.es_model.es_host,
+                es_user=self.es_model.es_user,
+                es_password=self.es_model.es_password,
+            )
+
+            # Indexer toutes les images
+            indexed_count = 0
+            
+            # Extraire toutes les images
+            all_images = [img for img, _ in all_images_metadata]
+            all_metadata = [metadata for _, metadata in all_images_metadata]
+
+            # Traiter par batch
+            for i in range(0, len(all_images), batch_size):
+                batch_images = all_images[i : i + batch_size]
+                batch_metadata = all_metadata[i : i + batch_size]
+
+                logger.info(
+                    f"🧮 Génération des embeddings pour le batch {i//batch_size + 1}/{(len(all_images) + batch_size - 1)//batch_size}"
                 )
 
-                # Traiter toutes les images de cette source
-                source_indexed = 0
+                try:
+                    # Générer tous les embeddings du batch
+                    embeddings = self.colpali_model.generate_embeddings(batch_images)
 
-                # Extraire toutes les images de cette source
-                all_images = [img for img, _ in images_metadata]
-                all_metadata = [metadata for _, metadata in images_metadata]
+                    # Préparer les documents pour l'indexation
+                    batch_documents = []
+                    for _j, (image, metadata, embedding) in enumerate(
+                        zip(batch_images, batch_metadata, embeddings, strict=False)
+                    ):
+                        # Encoder l'image en base64
+                        image_base64 = ScreenshotProcessor.encode_image_to_base64(image)
 
-                # Traiter par batch pour optimiser l'utilisation mémoire
-                for i in range(0, len(all_images), batch_size):
-                    batch_images = all_images[i : i + batch_size]
-                    batch_metadata = all_metadata[i : i + batch_size]
+                        # Préparer le document
+                        doc = {
+                            "col_pali_vectors": embedding,
+                            "metadata": metadata,
+                            "image_base64": image_base64,
+                            "filename": metadata["filename"],
+                            "source": metadata.get("original_source", "unknown"),
+                        }
 
-                    logger.info(
-                        f"🧮 Génération des embeddings pour le batch {i//batch_size + 1}/{(len(all_images) + batch_size - 1)//batch_size} (source: {source})"
-                    )
+                        batch_documents.append(doc)
 
-                    try:
-                        # Générer tous les embeddings du batch en une fois
-                        embeddings = self.colpali_model.generate_embeddings(batch_images)
+                    # Indexer ce batch
+                    if batch_documents:
+                        success = es_instance.bulk_index_documents(batch_documents)
+                        if success:
+                            indexed_count += len(batch_documents)
+                            logger.info(f"💾 Batch indexé: {len(batch_documents)} images")
+                        else:
+                            logger.error(f"❌ Échec de l'indexation du batch {i//batch_size + 1}")
 
-                        # Préparer les documents pour l'indexation
-                        batch_documents = []
-                        for _j, (image, metadata, embedding) in enumerate(
-                            zip(
-                                batch_images,
-                                batch_metadata,
-                                embeddings,
-                                strict=False,
-                            )
-                        ):
-                            # Encoder l'image en base64
-                            image_base64 = ScreenshotProcessor.encode_image_to_base64(image)
+                except Exception as e:
+                    logger.error(f"❌ Erreur lors du traitement du batch {i//batch_size + 1}: {e}")
+                    continue
 
-                            # Préparer le document
-                            doc = {
-                                "col_pali_vectors": embedding,
-                                "metadata": metadata,
-                                "image_base64": image_base64,
-                                "filename": metadata["filename"],
-                                "source": source,
-                            }
+            es_instance.close()
 
-                            batch_documents.append(doc)
-
-                        # Indexer ce batch
-                        if batch_documents:
-                            success = es_instance.bulk_index_documents(batch_documents)
-                            if success:
-                                source_indexed += len(batch_documents)
-                                logger.info(f"💾 Batch indexé: {len(batch_documents)} images")
-                            else:
-                                logger.error(f"❌ Échec de l'indexation du batch {i//batch_size + 1}")
-
-                    except Exception as e:
-                        logger.error(
-                            f"❌ Erreur lors du traitement du batch {i//batch_size + 1} pour la source {source}: {e}"
-                        )
-                        # Continuer avec le batch suivant
-                        continue
-
-                es_instance.close()
-
-                if source_indexed > 0:
-                    indexed_sources += 1
-                    total_indexed += source_indexed
-                    summary += (
-                        f"✅ {source}: {source_indexed}/{len(images_metadata)} images indexées dans '{index_name}'\n"
-                    )
-                else:
-                    summary += f"❌ {source}: Échec de l'indexation\n"
-
-            summary += "\n📈 Résumé final:\n"
-            summary += f"Sources traitées: {indexed_sources}/{total_sources}\n"
-            summary += f"Images indexées: {total_indexed}/{total_images}\n"
+            # Résumé final
+            summary += f"✅ Index créé: {index_name}\n"
+            summary += f"📷 Images indexées: {indexed_count}/{total_images}\n"
+            
+            if indexed_count < total_images:
+                summary += f"⚠️ {total_images - indexed_count} images n'ont pas pu être indexées\n"
 
             return [TextContent(type="text", text=summary)]
 

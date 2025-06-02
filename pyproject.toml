@@ -44,6 +44,7 @@ where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
 [tool.poetry.group.test.dependencies]
 pytest = "^8.3.5"
 
@@ -59,6 +60,3 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
-
-[tool.poetry]
-include = ["src/playwright_mcp/py.typed"]

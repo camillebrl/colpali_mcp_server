@@ -61,7 +61,7 @@ Recherche des images pertinentes dans la base de données.
 
 #### 📥 `index_image`
 Indexe une nouvelle image dans la base de données.
-Note que les images d'un folder sont indexées 4 par 4 (batch size de 4). Si mémoire GPU insuffisante, diminuer à 1 (mais ce sera plus long!).
+Note que les images d'un folder sont indexées 1 par 1 (batch size de 1). Si vous avez accès à une meilleure GPU, tester un batch_size plus grand.
 ```json
 {
   "tool": "index_image",
@@ -97,6 +97,12 @@ Vide complètement l'index (attention : irréversible).
     "confirm": true
   }
 }
+```
+
+#### Debugging
+Pour afficher les logs du server:
+```bash
+tail -n 1000 /tmp/colpali_mcp_startup.log
 ```
 
 ## 📚 Ressources
