@@ -1,8 +1,12 @@
 """Serveur MCP pour RAG sur base de données d'images avec ColPali et Elasticsearch."""
 
+import asyncio
 import base64
+import contextlib
 import logging
+import os
 import re
+import shutil
 import traceback
 import uuid
 from io import BytesIO
@@ -13,9 +17,10 @@ from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 from mcp.types import EmbeddedResource, ImageContent, TextContent, Tool
+from pdf2image import convert_from_path
 from PIL import Image
 
-from .colpali_model import ColPaliModel
+from .colpali_model import get_colpali_manager
 from .elasticsearch_model import ElasticsearchModel
 
 # Configuration du logging
@@ -24,6 +29,139 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+class PDFConverter:
+    """Convertisseur de PDF en images pour l'indexation."""
+
+    def __init__(self) -> None:
+        """Initialise le convertisseur PDF."""
+        pass
+
+    def convert_pdf_to_images(
+        self,
+        pdf_path: str,
+        output_dir: str,
+        dpi: int = 200,
+        image_format: str = "png",
+        prefix: str | None = None,
+        single_file: bool = False,
+    ) -> tuple[int, list[str]]:
+        """Convertit un PDF en images.
+
+        Args:
+            pdf_path: Chemin vers le fichier PDF
+            output_dir: Dossier de sortie pour les images
+            dpi: Résolution des images (défaut: 200)
+            image_format: Format des images (png, jpg, jpeg)
+            prefix: Préfixe pour les noms de fichiers (défaut: nom du PDF)
+            single_file: Si True, traite toutes les pages comme un seul document
+
+        Returns:
+            Tuple (nombre d'images créées, liste des chemins d'images)
+        """
+        # Vérifier que le PDF existe
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"Fichier PDF introuvable: {pdf_path}")
+
+        # Créer le dossier de sortie
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Déterminer le préfixe
+        if prefix is None:
+            prefix = Path(pdf_path).stem
+
+        # Nettoyer le préfixe
+        prefix = re.sub(r"[^a-zA-Z0-9\._-]", "_", prefix)
+
+        logger.info(f"🔄 Conversion du PDF: {pdf_path}")
+        logger.info(f"📁 Dossier de sortie: {output_dir}")
+        logger.info(f"🔧 DPI: {dpi}, Format: {image_format}")
+
+        try:
+            # Convertir le PDF en images
+            images = convert_from_path(pdf_path, dpi=dpi)
+
+            image_paths = []
+
+            if single_file:
+                # Sauvegarder toutes les pages avec le même nom de base
+                for i, image in enumerate(images):
+                    filename = f"{prefix}_page_{i+1:03d}.{image_format}"
+                    image_path = os.path.join(output_dir, filename)
+                    image.save(image_path, image_format.upper())
+                    image_paths.append(image_path)
+                    logger.info(f"✅ Page {i+1}/{len(images)} sauvegardée: {filename}")
+
+            return len(images), image_paths
+
+        except Exception as e:
+            logger.error(f"Erreur lors de la conversion PDF: {e}")
+            raise
+
+    def convert_pdfs_directory(
+        self,
+        input_dir: str,
+        output_dir: str,
+        dpi: int = 200,
+        image_format: str = "png",
+        single_file_per_pdf: bool = True,
+        clear_output: bool = False,
+    ) -> dict[str, int]:
+        """Convertit tous les PDFs d'un répertoire en images.
+
+        Args:
+            input_dir: Dossier contenant les PDFs
+            output_dir: Dossier de sortie pour les images
+            dpi: Résolution des images
+            image_format: Format des images
+            single_file_per_pdf: Si True, groupe toutes les pages d'un PDF
+            clear_output: Si True, vide le dossier de sortie avant
+
+        Returns:
+            Dictionnaire {nom_pdf: nombre_pages}
+        """
+        # Vérifier le dossier d'entrée
+        if not os.path.exists(input_dir):
+            raise FileNotFoundError(f"Dossier PDF introuvable: {input_dir}")
+
+        # Vider le dossier de sortie si demandé
+        if clear_output and os.path.exists(output_dir):
+            logger.warning(f"🗑️ Suppression du contenu de: {output_dir}")
+            shutil.rmtree(output_dir)
+
+        # Créer le dossier de sortie
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Lister tous les PDFs
+        pdf_files = [f for f in os.listdir(input_dir) if f.lower().endswith(".pdf")]
+
+        if not pdf_files:
+            logger.warning(f"⚠️ Aucun fichier PDF trouvé dans: {input_dir}")
+            return {}
+
+        results = {}
+
+        for pdf_file in pdf_files:
+            pdf_path = os.path.join(input_dir, pdf_file)
+            pdf_name = Path(pdf_file).stem
+
+            try:
+                num_pages, _ = self.convert_pdf_to_images(
+                    pdf_path=pdf_path,
+                    output_dir=output_dir,
+                    dpi=dpi,
+                    image_format=image_format,
+                    prefix=pdf_name,
+                    single_file=single_file_per_pdf,
+                )
+                results[pdf_file] = num_pages
+
+            except Exception as e:
+                logger.error(f"❌ Échec de conversion pour {pdf_file}: {e}")
+                results[pdf_file] = 0
+
+        return results
 
 
 class ScreenshotProcessor:
@@ -158,7 +296,7 @@ class IndexSelector:
             logger.error(f"Erreur lors de la récupération des index: {e}")
             return []
 
-    def select_relevant_indices(self, query: str, max_indices: int = 3) -> list[str]:
+    def select_relevant_indices(self, query: str, max_indices: int = 2) -> list[str]:
         """Sélectionne les index les plus pertinents basés sur la requête.
 
         Args:
@@ -263,14 +401,15 @@ class ImageRAGServer:
     ):
         """Initialise le serveur RAG."""
         self.server: Server = Server("image-rag-server")
+        self.colpali_model_path = colpali_model_path
+        self.cleanup_task: asyncio.Task | None = None
 
         # Initialiser les modèles
         logger.info("🚀 Initialisation du serveur Image RAG...")
 
         try:
-            # Modèle ColPali pour les embeddings
-            logger.info("📦 Chargement du modèle ColPali...")
-            self.colpali_model = ColPaliModel(model_path=colpali_model_path)
+            # Ne PAS charger le modèle ColPali au démarrage
+            logger.info("📦 Modèle ColPali configuré (chargement différé)")
 
             # Client Elasticsearch (sans index spécifique)
             logger.info("🔌 Connexion à Elasticsearch...")
@@ -297,6 +436,18 @@ class ImageRAGServer:
             raise
 
         self._setup_handlers()
+
+    async def _periodic_cleanup(self) -> None:
+        """Tâche périodique pour vérifier et décharger le modèle si inutilisé."""
+        while True:
+            try:
+                await asyncio.sleep(30)  # Vérifier toutes les 30 secondes
+                manager = get_colpali_manager()
+                manager.check_and_unload()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Erreur dans la tâche de nettoyage: {e}")
 
     def _setup_handlers(self) -> None:
         """Configure les gestionnaires MCP."""
@@ -325,7 +476,7 @@ class ImageRAGServer:
                             "max_indices": {
                                 "type": "integer",
                                 "description": "Nombre maximum d'index à rechercher",
-                                "default": 3,
+                                "default": 2,
                                 "minimum": 1,
                                 "maximum": 10,
                             },
@@ -359,7 +510,7 @@ class ImageRAGServer:
                             "single_index": {
                                 "type": "boolean",
                                 "description": "Créer un seul index pour toutes les images (défaut: true)",
-                                "default": True, 
+                                "default": True,
                             },
                             "index_name": {
                                 "type": "string",
@@ -369,7 +520,6 @@ class ImageRAGServer:
                         },
                     },
                 ),
-
                 Tool(
                     name="list_screenshot_indices",
                     description="Lister tous les index de screenshots disponibles avec leurs statistiques",
@@ -394,6 +544,56 @@ class ImageRAGServer:
                         "required": ["index_name", "confirm"],
                     },
                 ),
+                Tool(
+                    name="get_model_status",
+                    description="Obtenir l'état actuel du modèle ColPali (chargé/déchargé, mémoire utilisée, etc.)",
+                    inputSchema={"type": "object", "properties": {}},
+                ),
+                Tool(
+                    name="convert_pdf_to_images",
+                    description="Convertir des fichiers PDF en images pour l'indexation avec ColPali. Peut traiter un PDF unique ou un dossier entier.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "pdf_path": {
+                                "type": "string",
+                                "description": "Chemin vers un fichier PDF spécifique (utilisé si pdf_directory n'est pas fourni)",
+                            },
+                            "pdf_directory": {
+                                "type": "string",
+                                "description": "Dossier contenant des fichiers PDF à convertir",
+                            },
+                            "output_directory": {
+                                "type": "string",
+                                "description": "Dossier de sortie pour les images converties",
+                                "default": "./screenshots",
+                            },
+                            "dpi": {
+                                "type": "integer",
+                                "description": "Résolution DPI pour la conversion (plus élevé = meilleure qualité)",
+                                "default": 200,
+                                "minimum": 72,
+                                "maximum": 600,
+                            },
+                            "image_format": {
+                                "type": "string",
+                                "description": "Format des images de sortie",
+                                "enum": ["png", "jpg", "jpeg"],
+                                "default": "png",
+                            },
+                            "clear_output": {
+                                "type": "boolean",
+                                "description": "Vider le dossier de sortie avant la conversion",
+                                "default": False,
+                            },
+                            "single_file_per_pdf": {
+                                "type": "boolean",
+                                "description": "Grouper toutes les pages d'un PDF sous le même nom de base",
+                                "default": True,
+                            },
+                        },
+                    },
+                ),
             ]
             return tools
 
@@ -409,6 +609,10 @@ class ImageRAGServer:
                     return await self._list_screenshot_indices(arguments)
                 elif name == "delete_screenshot_index":
                     return await self._delete_screenshot_index(arguments)
+                elif name == "get_model_status":
+                    return await self._get_model_status(arguments)
+                elif name == "convert_pdf_to_images":
+                    return await self._convert_pdf_to_images(arguments)
                 else:
                     return [TextContent(type="text", text=f"❌ Outil inconnu: {name}")]
 
@@ -420,33 +624,37 @@ class ImageRAGServer:
         """Trouve le préfixe commun le plus long dans une liste de chaînes."""
         if not strings:
             return ""
-        
+
         # Trier pour faciliter la comparaison
         strings = sorted(strings)
         first = strings[0]
         last = strings[-1]
-        
+
         # Trouver le préfixe commun entre le premier et le dernier
         i = 0
         while i < len(first) and i < len(last) and first[i] == last[i]:
             i += 1
-        
+
         # Retourner le préfixe commun
         prefix = first[:i]
-        
+
         # Si le préfixe se termine par un séparateur incomplet, le retirer
-        if prefix and prefix[-1] in ['_', '-', '.']:
+        if prefix and prefix[-1] in ["_", "-", "."]:
             prefix = prefix[:-1]
-        
+
         return prefix
-    
+
     async def _search_screenshots(self, args: dict[str, Any]) -> list[TextContent | ImageContent | EmbeddedResource]:
         """Recherche des screenshots pertinents dans les index sélectionnés."""
         query = args["query"]
         top_k = args.get("top_k", 5)
-        max_indices = args.get("max_indices", 3)
+        max_indices = args.get("max_indices", 2)
 
         logger.info(f"🔍 Recherche: '{query}' (top_k={top_k}, max_indices={max_indices})")
+
+        # Acquérir le modèle ColPali pour cette opération
+        manager = get_colpali_manager()
+        colpali_model = manager.acquire(self.colpali_model_path)
 
         try:
             # Sélectionner les index pertinents
@@ -462,7 +670,7 @@ class ImageRAGServer:
 
             # Générer l'embedding de la requête
             logger.info("🧮 Génération de l'embedding de la requête...")
-            query_embedding = self.colpali_model.generate_query_embedding(query)
+            query_embedding = colpali_model.generate_query_embedding(query)
 
             # Rechercher dans chaque index sélectionné
             all_results = []
@@ -560,15 +768,22 @@ class ImageRAGServer:
                     text=f"❌ Erreur lors de la recherche: {str(e)}",
                 )
             ]
+        finally:
+            # Libérer le modèle
+            colpali_model.cleanup()
 
     async def _index_screenshots(self, args: dict[str, Any]) -> list[TextContent | ImageContent | EmbeddedResource]:
         """Indexe les screenshots depuis le dossier spécifié dans UN SEUL index."""
         screenshots_dir = args.get("screenshots_dir", "./screenshots")
         overwrite_existing = args.get("overwrite_existing", False)
         batch_size = args.get("batch_size", 1)
-        custom_index_name = args.get("index_name", None)
+        custom_index_name = args.get("index_name")
 
         logger.info(f"📥 Indexation des screenshots depuis: {screenshots_dir}")
+
+        # Acquérir le modèle ColPali pour cette opération
+        manager = get_colpali_manager()
+        colpali_model = manager.acquire(self.colpali_model_path)
 
         try:
             # Initialiser le processeur de screenshots
@@ -592,11 +807,11 @@ class ImageRAGServer:
             else:
                 # Utiliser le nom du dossier ou un nom par défaut
                 folder_name = Path(screenshots_dir).name
-                
+
                 if folder_name == "screenshots":
                     # Chercher un pattern commun dans les noms de fichiers
                     all_sources = list(screenshots_by_source.keys())
-                    
+
                     if len(all_sources) == 1:
                         # Une seule source détectée, l'utiliser
                         index_base_name = all_sources[0]
@@ -608,6 +823,7 @@ class ImageRAGServer:
                         else:
                             # Pas de préfixe commun, utiliser un nom générique avec timestamp
                             from datetime import datetime
+
                             timestamp = datetime.now().strftime("%Y%m%d_%H%M")
                             index_base_name = f"all_screenshots_{timestamp}"
                 else:
@@ -654,7 +870,7 @@ class ImageRAGServer:
 
             # Indexer toutes les images
             indexed_count = 0
-            
+
             # Extraire toutes les images
             all_images = [img for img, _ in all_images_metadata]
             all_metadata = [metadata for _, metadata in all_images_metadata]
@@ -670,12 +886,17 @@ class ImageRAGServer:
 
                 try:
                     # Générer tous les embeddings du batch
-                    embeddings = self.colpali_model.generate_embeddings(batch_images)
+                    embeddings = colpali_model.generate_embeddings(batch_images)
 
                     # Préparer les documents pour l'indexation
                     batch_documents = []
                     for _j, (image, metadata, embedding) in enumerate(
-                        zip(batch_images, batch_metadata, embeddings, strict=False)
+                        zip(
+                            batch_images,
+                            batch_metadata,
+                            embeddings,
+                            strict=False,
+                        )
                     ):
                         # Encoder l'image en base64
                         image_base64 = ScreenshotProcessor.encode_image_to_base64(image)
@@ -709,7 +930,7 @@ class ImageRAGServer:
             # Résumé final
             summary += f"✅ Index créé: {index_name}\n"
             summary += f"📷 Images indexées: {indexed_count}/{total_images}\n"
-            
+
             if indexed_count < total_images:
                 summary += f"⚠️ {total_images - indexed_count} images n'ont pas pu être indexées\n"
 
@@ -724,6 +945,9 @@ class ImageRAGServer:
                     text=f"❌ Erreur lors de l'indexation: {str(e)}",
                 )
             ]
+        finally:
+            # Libérer le modèle
+            colpali_model.cleanup()
 
     async def _list_screenshot_indices(
         self, args: dict[str, Any]
@@ -829,11 +1053,44 @@ class ImageRAGServer:
             logger.error(f"Erreur lors de la suppression de l'index: {e}")
             return [TextContent(type="text", text=f"❌ Erreur: {str(e)}")]
 
+    async def _get_model_status(self, args: dict[str, Any]) -> list[TextContent | ImageContent | EmbeddedResource]:
+        """Obtient l'état actuel du modèle ColPali."""
+        try:
+            manager = get_colpali_manager()
+            info = manager.get_model_info()
+
+            status = "🤖 État du modèle ColPali\n\n"
+
+            if info["loaded"]:
+                status += "✅ État: CHARGÉ\n"
+                status += f"📦 Modèle: {info['model_path']}\n"
+                status += f"🔗 Références actives: {info['reference_count']}\n"
+
+                if info.get("gpu_memory_allocated"):
+                    status += f"💾 Mémoire GPU: {info['gpu_memory_allocated']}\n"
+
+                if info["last_used"] is not None:
+                    status += f"⏱️ Dernière utilisation: il y a {info['last_used']:.1f} secondes\n"
+
+                status += "\n💡 Le modèle sera automatiquement déchargé après 30s d'inactivité"
+            else:
+                status += "💤 État: DÉCHARGÉ\n"
+                status += "💡 Le modèle sera chargé automatiquement lors de la prochaine utilisation"
+
+            return [TextContent(type="text", text=status)]
+
+        except Exception as e:
+            logger.error(f"Erreur lors de la récupération du statut: {e}")
+            return [TextContent(type="text", text=f"❌ Erreur: {str(e)}")]
+
     async def run(self, read_stream: Any, write_stream: Any) -> None:
         """Lance le serveur MCP."""
         logger.info("🌐 Démarrage du serveur Image RAG...")
 
         try:
+            # Démarrer la tâche de nettoyage périodique
+            self.cleanup_task = asyncio.create_task(self._periodic_cleanup())
+
             # Créer des options d'initialisation minimales mais complètes
             init_options = InitializationOptions(
                 server_name="colpali-server",
@@ -853,13 +1110,136 @@ class ImageRAGServer:
         finally:
             # Nettoyage
             logger.info("🧹 Arrêt du serveur...")
+
+            # Annuler la tâche de nettoyage
+            if self.cleanup_task:
+                self.cleanup_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.cleanup_task
+
             try:
-                if hasattr(self, "colpali_model"):
-                    self.colpali_model.cleanup()
+                # Forcer le déchargement du modèle s'il est encore chargé
+                manager = get_colpali_manager()
+                if manager.is_loaded:
+                    logger.info("🧹 Déchargement du modèle ColPali...")
+                    manager._unload_model()
+
                 if hasattr(self, "es_model"):
                     self.es_model.close()
             except Exception as e:
                 logger.warning(f"Avertissement lors du nettoyage: {e}")
+
+    async def _convert_pdf_to_images(
+        self, args: dict[str, Any]
+    ) -> list[TextContent | ImageContent | EmbeddedResource]:
+        """Convertit des PDFs en images."""
+        pdf_path = args.get("pdf_path")
+        pdf_directory = args.get("pdf_directory")
+        output_directory = args.get("output_directory", "./screenshots")
+        dpi = args.get("dpi", 200)
+        image_format = args.get("image_format", "png")
+        clear_output = args.get("clear_output", False)
+        single_file_per_pdf = args.get("single_file_per_pdf", True)
+
+        # Vérifier qu'au moins une source est fournie
+        if not pdf_path and not pdf_directory:
+            return [
+                TextContent(
+                    type="text",
+                    text="❌ Veuillez fournir soit 'pdf_path' pour un fichier unique, soit 'pdf_directory' pour un dossier de PDFs.",
+                )
+            ]
+
+        try:
+            converter = PDFConverter()
+            summary = "📄 Conversion PDF vers images\n\n"
+
+            if pdf_directory:
+                # Convertir un dossier entier
+                logger.info(f"📂 Conversion du dossier: {pdf_directory}")
+
+                results = converter.convert_pdfs_directory(
+                    input_dir=pdf_directory,
+                    output_dir=output_directory,
+                    dpi=dpi,
+                    image_format=image_format,
+                    single_file_per_pdf=single_file_per_pdf,
+                    clear_output=clear_output,
+                )
+
+                total_pages = sum(results.values())
+                successful_pdfs = sum(1 for pages in results.values() if pages > 0)
+
+                summary += "📊 Statistiques de conversion:\n"
+                summary += f"   📁 Dossier source: {pdf_directory}\n"
+                summary += f"   📁 Dossier de sortie: {output_directory}\n"
+                summary += f"   📄 PDFs traités: {len(results)}\n"
+                summary += f"   ✅ Conversions réussies: {successful_pdfs}\n"
+                summary += f"   📑 Total de pages converties: {total_pages}\n"
+                summary += f"   🎨 Format: {image_format.upper()} ({dpi} DPI)\n\n"
+
+                summary += "📋 Détails par fichier:\n"
+                for pdf_name, num_pages in sorted(results.items()):
+                    if num_pages > 0:
+                        summary += f"   ✅ {pdf_name}: {num_pages} pages\n"
+                    else:
+                        summary += f"   ❌ {pdf_name}: échec\n"
+
+            else:
+                # Convertir un fichier unique
+                logger.info(f"📄 Conversion du fichier: {pdf_path}")
+
+                if pdf_path is None:
+                    return [
+                        TextContent(
+                            type="text",
+                            text="❌ Le paramètre 'pdf_path' ne peut pas être None",
+                        )
+                    ]
+
+                num_pages, image_paths = converter.convert_pdf_to_images(
+                    pdf_path=pdf_path,
+                    output_dir=output_directory,
+                    dpi=dpi,
+                    image_format=image_format,
+                    single_file=single_file_per_pdf,
+                )
+
+                summary += "✅ Conversion réussie!\n"
+                summary += f"   📄 Fichier source: {pdf_path}\n"
+                summary += f"   📁 Dossier de sortie: {output_directory}\n"
+                summary += f"   📑 Pages converties: {num_pages}\n"
+                summary += f"   🎨 Format: {image_format.upper()} ({dpi} DPI)\n\n"
+
+                if len(image_paths) <= 10:
+                    summary += "📷 Images créées:\n"
+                    for img_path in image_paths:
+                        summary += f"   - {os.path.basename(img_path)}\n"
+                else:
+                    summary += f"📷 {len(image_paths)} images créées\n"
+
+            summary += (
+                f"\n💡 Utilisez 'index_screenshots' avec screenshots_dir='{output_directory}' pour indexer ces images."
+            )
+
+            return [TextContent(type="text", text=summary)]
+
+        except FileNotFoundError as e:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"❌ Fichier/Dossier introuvable: {str(e)}",
+                )
+            ]
+        except Exception as e:
+            logger.error(f"Erreur lors de la conversion PDF: {e}")
+            logger.error(traceback.format_exc())
+            return [
+                TextContent(
+                    type="text",
+                    text=f"❌ Erreur lors de la conversion: {str(e)}",
+                )
+            ]
 
 
 async def main() -> None:

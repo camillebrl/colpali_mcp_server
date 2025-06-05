@@ -8,6 +8,7 @@ PROJECT := colpali_server
 # Installation
 install:
 	$(POETRY) install
+	sudo apt-get install poppler-utils
 	@echo "✅ Installation terminée"
 
 # Tests
@@ -25,8 +26,8 @@ format:
 	ruff check src/ --ignore D107 --fix --unsafe-fixes
 	ruff format tests/
 	ruff check tests/ --ignore D107 --fix --unsafe-fixes
-	$(POETRY) run mypy src/
-	$(POETRY) run mypy tests/
+	$(POETRY) run mypy --config-file mypy.ini src/
+	$(POETRY) run mypy --config-file mypy.ini tests/
 	
 # Nettoyage
 clean:

@@ -3,12 +3,22 @@
 # IMPORTANT: Rediriger TOUS les messages de debug vers stderr
 # MCP nécessite que stdout soit réservé uniquement pour les messages JSON
 
+# Forcer PyTorch à libérer la mémoire GPU immédiatement
+export PYTORCH_NO_CUDA_MEMORY_CACHING="1"
+export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,garbage_collection_threshold:0.8"
+export CUDA_LAUNCH_BLOCKING="0"
+
 # Logs de debug vers un fichier séparé
 DEBUG_LOG="/tmp/colpali_mcp_startup.log"
 exec 2>$DEBUG_LOG
 
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_DIR="$SCRIPT_DIR"
+
 echo "=== Démarrage du serveur ColPali avec Elasticsearch ===" >&2
 echo "Date: $(date)" >&2
+echo "Répertoire du projet: $PROJECT_DIR" >&2
+echo "Log de debug: $DEBUG_LOG" >&2
 
 echo "🔄 Vidage de la mémoire CUDA..." >&2
 
@@ -32,8 +42,8 @@ EOF
 echo "🔄 Mémoire CUDA vidée (autant que possible)" >&2
 
 # Aller dans le répertoire du projet
-cd /home/camil/Documents/colpali_server || {
-    echo "❌ Impossible d'accéder au répertoire du projet" >&2
+cd "$PROJECT_DIR" || {
+    echo "❌ Impossible d'accéder au répertoire du projet: $PROJECT_DIR" >&2
     exit 1
 }
 
@@ -59,9 +69,6 @@ if [ ! -f "pyproject.toml" ]; then
     echo "❌ pyproject.toml non trouvé. Êtes-vous dans le bon répertoire ?" >&2
     exit 1
 fi
-
-# Path pour Poetry
-export PATH="/home/camil/.local/bin:$PATH"
 
 # Vérifier si Poetry est installé
 if ! command -v poetry >/dev/null 2>&1; then
@@ -95,6 +102,14 @@ fi
 
 echo "🚀 Lancement du serveur ColPali MCP..." >&2
 echo "Tous les vérifications passées, démarrage du serveur..." >&2
+
+# Vérifier le nettoyage GPU
+CLEANUP_SCRIPT="./cleanup_gpu.py"
+if [ -f "$CLEANUP_SCRIPT" ]; then
+    echo "🧹 Exécution du script de nettoyage GPU..." >&2
+    $PYTHON_CMD "$CLEANUP_SCRIPT" --kill-all --force 2>>$DEBUG_LOG || true
+    echo "✅ Nettoyage GPU terminé" >&2
+fi
 
 # Lancer le serveur ColPali
 # stdout reste propre pour MCP, stderr va dans le log de debug

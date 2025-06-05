@@ -110,3 +110,6 @@ tail -n 1000 /tmp/colpali_mcp_startup.log
 - [Documentation MCP](https://modelcontextprotocol.io)
 - [ColPali Paper](https://arxiv.org/abs/2407.01449)
 - [Elasticsearch Guide](https://www.elastic.co/guide/en/elasticsearch/reference/current/index.html)
+
+## NOTE
+Si vous avez plus de capacité GPU, modifiez le maximul top_k dans le image_rag_server.py pour le tool search_screenshots à + (en fonction de vos ressources). Car en effet, c'est le nombre max d'images que prendra le vlm mcp server tool search en entrée.
